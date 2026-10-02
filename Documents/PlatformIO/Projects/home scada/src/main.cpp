@@ -4,23 +4,30 @@
 #include <NRFLite.h>
 #include <FastLED.h>
 
+#define E_STOP 14
+
 // WS2812B status
 constexpr int STAT_LED = 48;
 CRGB led_stat[1];
 
 // WS2812B string
 constexpr int LED_PIN = 17;
-constexpr int NUM_LEDS = 16;
+constexpr int NUM_LEDS = 20;
 constexpr uint8_t LED_BRIGHTNESS = 64;   // 0-255, 25% is plenty indoors
 CRGB leds[NUM_LEDS];
 
-// Shared SPI bus (SPI2/FSPI native pins)
-constexpr int SPI_SCK = 12, SPI_MOSI = 11, SPI_MISO = 13;
-// Chip selects and control pins
-constexpr int VFD_CS = 10, VFD_RST = 14;
+// // Shared SPI bus (SPI2/FSPI native pins)
+// constexpr int SPI_SCK = 12, SPI_MOSI = 11, SPI_MISO = 13;
+// // Chip selects and control pins
+// constexpr int VFD_CS = 10, VFD_RST = 14;
+// VFD: own bus (SPI3/HSPI)
+constexpr int VFD_SCK = 12, VFD_MOSI = 11, VFD_CS = 10, VFD_RST = 13;
+// nRF24: global SPI (SPI2/FSPI), required by NRFLite
+constexpr int NRF_SCK = 40, NRF_MOSI = 41, NRF_MISO = 42, NRF_CSN = 15, NRF_CE = 16;
+// Rotary encoder (moved off 40-42)
+constexpr int ENC_A = 39, ENC_B = 38, ENC_SW = 47;
 
 // NRF24L01
-constexpr int NRF_CSN = 15, NRF_CE = 16;
 const static uint8_t RADIO_ID = 112;
 const static uint8_t DESTINATION_RADIO_ID = 97;
 
@@ -56,8 +63,8 @@ unsigned long lastPacketSent;
 void sendPacket() {
   if(millis() - lastPacketSent > 10) {
     if(!_base.send(DESTINATION_RADIO_ID, &_satelliteData, sizeof(_satelliteData), NRFLite::NO_ACK)) {
-      leds[0] = CRGB::Red;
-      FastLED.show();
+      // leds[0] = CRGB::Red;
+      // FastLED.show();
       delay(500);
       Serial.println("send packet failed");
     } else {
@@ -72,42 +79,76 @@ const uint8_t pads[] = {1, 2, 3, 4, 5, 6};
 constexpr int N_PADS = sizeof(pads);
 uint32_t baseline[N_PADS];
 
+SPIClass vfdSPI(HSPI);
+
+uint8_t vfd_byte_cb(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr) {
+  switch (msg) {
+    case U8X8_MSG_BYTE_SEND:
+      vfdSPI.writeBytes((uint8_t *)arg_ptr, arg_int);
+      break;
+    case U8X8_MSG_BYTE_INIT:
+      if (u8x8->bus_clock == 0) u8x8->bus_clock = u8x8->display_info->sck_clock_hz;
+      u8x8_gpio_SetCS(u8x8, u8x8->display_info->chip_disable_level);
+      break;
+    case U8X8_MSG_BYTE_SET_DC:
+      u8x8_gpio_SetDC(u8x8, arg_int);
+      break;
+    case U8X8_MSG_BYTE_START_TRANSFER: {
+      static const uint8_t modes[] = {SPI_MODE0, SPI_MODE1, SPI_MODE2, SPI_MODE3};
+      vfdSPI.beginTransaction(SPISettings(u8x8->bus_clock, MSBFIRST,
+                                          modes[u8x8->display_info->spi_mode & 3]));
+      u8x8_gpio_SetCS(u8x8, u8x8->display_info->chip_enable_level);
+      u8x8->gpio_and_delay_cb(u8x8, U8X8_MSG_DELAY_NANO,
+                              u8x8->display_info->post_chip_enable_wait_ns, NULL);
+      break;
+    }
+    case U8X8_MSG_BYTE_END_TRANSFER:
+      u8x8->gpio_and_delay_cb(u8x8, U8X8_MSG_DELAY_NANO,
+                              u8x8->display_info->pre_chip_disable_wait_ns, NULL);
+      u8x8_gpio_SetCS(u8x8, u8x8->display_info->chip_disable_level);
+      vfdSPI.endTransaction();
+      break;
+    default:
+      return 0;
+  }
+  return 1;
+}
+
 U8G2_GP1294AI_256X48_F_4W_HW_SPI u8g2(U8G2_R0, VFD_CS, U8X8_PIN_NONE, VFD_RST);
-NRFLite radio;
 
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200);
   delay(500);
 
-  // Deselect both devices before any bus traffic
-  pinMode(VFD_CS, OUTPUT);  digitalWrite(VFD_CS, HIGH);
-  pinMode(NRF_CSN, OUTPUT); digitalWrite(NRF_CSN, HIGH);
+  pinMode(E_STOP, INPUT_PULLUP);
 
   // FastLED.addLeds<WS2812, STAT_LED, GRB>(led_stat, 1);
-  FastLED.setBrightness(30);
-  delay(100);
+  // FastLED.setBrightness(30);
+  // delay(100);
   // fill_solid(led_stat, 1 , CRGB::Red);
-  FastLED.show();
-  delay(1000);
+  // FastLED.show();
+  // delay(1000);
 
-  FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
+  // FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
   // FastLED.setMaxPowerInVoltsAndMilliamps(5, 500);   // cap current draw
   // FastLED.clear(true);                              // all off, pushed immediately
-  Serial.println("LEDs initialized");
+  // Serial.println("LEDs initialized");
   // led_stat[0] = CRGB::Green;
-  FastLED.show();
-  delay(500);
-
-  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, -1);   // CS handled per device
-
-  // u8g2.begin();                                  // SPI.begin() inside is a no-op now
-  // u8g2.setContrast(255);
-  // Serial.println("VFD initialized");
-  // // led_stat[0] = CRGB::Blue;
-  // FastLED.show();
+  
   // delay(500);
+  // fill_solid(leds, NUM_LEDS, CRGB::Green);
+  // FastLED.show();
 
-  if (!radio.init(RADIO_ID, NRF_CE, NRF_CSN, NRFLite::BITRATE2MBPS, 100, 0)) {
+  // VFD on its own bus
+  vfdSPI.begin(VFD_SCK, -1, VFD_MOSI, -1);      // no MISO; CS driven by U8g2
+  u8g2.getU8x8()->byte_cb = vfd_byte_cb;        // must be set before begin()
+  // u8g2.begin();
+  // u8g2.setContrast(255);
+
+  // nRF on global SPI
+  pinMode(NRF_CSN, OUTPUT); digitalWrite(NRF_CSN, HIGH);
+  SPI.begin(NRF_SCK, NRF_MISO, NRF_MOSI, -1);
+  if (!_base.init(RADIO_ID, NRF_CE, NRF_CSN, NRFLite::BITRATE2MBPS, 100, 0)) {
     Serial.println("nRF24L01 not responding, check wiring/power");
     while (1) {
       // led_stat[0] = CRGB::Red;
@@ -121,8 +162,22 @@ void setup() {
   Serial.println("nRF24L01 initialized");
   lastPacketSent = millis();
   // led_stat[0] = CRGB::White;
-  FastLED.show();
-  delay(5000);
+  // FastLED.show();
+  delay(2000);
+
+  // Encoder
+  pinMode(ENC_A, INPUT_PULLUP);
+  pinMode(ENC_B, INPUT_PULLUP);
+  pinMode(ENC_SW, INPUT_PULLUP);
+
+  u8g2.begin();                                  // SPI.begin() inside is a no-op now
+  u8g2.setContrast(255);
+  Serial.println("VFD initialized");
+  // led_stat[0] = CRGB::Blue;
+  // FastLED.show();
+  delay(500);
+
+  
 
   // for (int i = 0; i < N_PADS; i++) {             // don't touch pads during boot
   //   uint64_t sum = 0;
@@ -167,16 +222,16 @@ void drawURL(void)
 }
 
 void loop() {
-  // u8g2.clearBuffer();
-  // drawLogo();
-  // drawURL();
-  // u8g2.sendBuffer();
-  // delay(1000);
+  u8g2.clearBuffer();
+  drawLogo();
+  drawURL();
+  u8g2.sendBuffer();
+  delay(1000);
 
 
-  _satelliteData.qcomm = 17;
-  _satelliteData.extra = 13;
-  _satelliteData.speed = 30;
+  _satelliteData.qcomm = 0;
+  _satelliteData.extra = 0;
+  _satelliteData.speed = 0;
   _satelliteData.randfactor = 0;
 
   _satelliteData.formfactor = 0;
@@ -184,7 +239,7 @@ void loop() {
   //software revision / pattern support
   _satelliteData.rev = 0;
   _satelliteData.brightKey = 255;
-  _satelliteData.zone = 65535;
+  _satelliteData.zone = 0;
 
   sendPacket();
   Serial.println("sent radio command");
