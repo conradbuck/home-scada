@@ -5,6 +5,8 @@
 #include <FastLED.h>
 
 #define E_STOP 14
+#define IR_LED 21
+//7,8,9,18 pins still open
 
 // WS2812B status
 constexpr int STAT_LED = 48;
